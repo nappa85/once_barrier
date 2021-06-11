@@ -1,4 +1,4 @@
-use std::{cmp::Eq, collections::HashMap, future::Future, hash::Hash, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{cmp::Eq, collections::HashMap, future::Future, hash::Hash, sync::Arc, time::Duration};
 
 use tokio::{sync::RwLock, time::sleep};
 
@@ -29,19 +29,16 @@ where T: Hash + Eq + Clone + Send + Sync + 'static {
         }
     }
 
-    pub async fn get<Read, Write, ReadFut, WriteFut, Out>(&self, key: T, read_callback: Read, write_callback: Write) -> Out
+    pub async fn get<'a, Read, ReadFut, Write, WriteFut, Out>(&self, key: T, read_callback: Read, write_callback: Write) -> Out
     where
-        // at the moment it's impossible to express the lifetime  of the future, until HRTB is stable
-        // therefore we need to pass the owned value T instead of &T
-        Read: (FnOnce(&T) -> ReadFut) + Unpin,
-        Write: (FnOnce(&T) -> WriteFut) + Unpin,
-        ReadFut: Future<Output=Out> + Unpin,
-        WriteFut: Future<Output=Out> + Unpin,
+        Read: Fn(&'a T) -> ReadFut,
+        ReadFut: Future<Output=Out> + 'a,
+        Write: Fn(&'a T) -> WriteFut,
+        WriteFut: Future<Output=Out> + 'a,
     {
         // check if entry exists
         if self.can_read(&key).await {
-            let w = Wrapper::new(&key, read_callback);
-            return w.await;
+            return read_callback(&key).await;
         }
 
         // entry still doesn't exists
@@ -50,8 +47,7 @@ where T: Hash + Eq + Clone + Send + Sync + 'static {
             // we are late, drop write lock to dequeue and retry
             drop(lock);
             if self.can_read(&key).await {
-                let w = Wrapper::new(&key, read_callback);
-                return w.await;
+                return read_callback(&key).await;
             }
             else {
                 unreachable!();
@@ -64,9 +60,8 @@ where T: Hash + Eq + Clone + Send + Sync + 'static {
         let temp = inner.write().await;
         drop(lock);
 
-        // create the file
-        let w = Wrapper::new(&key, write_callback);
-        let res = w.await;
+        // call write callback
+        let res = write_callback(&key).await;
         // delete the entry after given time
         let delay = self.delay;
         let inner = Arc::clone(&self.inner);
@@ -81,50 +76,6 @@ where T: Hash + Eq + Clone + Send + Sync + 'static {
     }
 }
 
-struct Wrapper<'a, T, F, Fut>
-where
-    F: (FnOnce(&'a T) -> Fut) + Unpin,
-    Fut: Future + Unpin + 'a,
-{
-    param: &'a T,
-    inner: Option<F>,
-    temp: Option<Fut>,
-}
-
-impl<'a, T, F, Fut> Wrapper<'a, T, F, Fut>
-where
-    F: (FnOnce(&'a T) -> Fut) + Unpin,
-    Fut: Future + Unpin + 'a,
-{
-    fn new(param: &'a T, inner: F) -> Self {
-        Wrapper {
-            param,
-            inner: Some(inner),
-            temp: None,
-        }
-    }
-}
-
-impl<'a, T, F, Fut> Future for Wrapper<'a, T, F, Fut>
-where
-    F: (FnOnce(&'a T) -> Fut) + Unpin,
-    Fut: Future + Unpin + 'a,
-{
-    type Output = Fut::Output;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if let Some(f) = this.inner.take() {
-            this.temp = Some(f(this.param));
-        }
-        if let Some(f) = this.temp.as_mut() {
-            Pin::new(f).poll(cx)
-        }
-        else {
-            unreachable!()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -134,7 +85,7 @@ mod tests {
     #[tokio::test]
     async fn it_works() {
         let ob = OnceBarrier::new(Duration::from_secs(1));
-        println!("{}", ob.get(String::from("foo"), |foo| Box::pin(async move { println!("read {}", foo); 1_u8 }), |foo| Box::pin(async move { println!("write {}", foo); 2_u8 })).await);
-        println!("{}", ob.get(String::from("foo"), |foo| Box::pin(async move { println!("read {}", foo); 1_u8 }), |foo| Box::pin(async move { println!("write {}", foo); 2_u8 })).await);
+        println!("{}", ob.get(String::from("foo"), |foo| async move { println!("read {}", foo); 1_u8 }, |foo| async move { println!("write {}", foo); 2_u8 }).await);
+        println!("{}", ob.get(String::from("foo"), |foo| async move { println!("read {}", foo); 1_u8 }, |foo| async move { println!("write {}", foo); 2_u8 }).await);
     }
 }
